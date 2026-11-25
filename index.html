@@ -327,15 +327,63 @@ if (Array.isArray(cfg.lessons)) cfg.lessons = { 1: cfg.lessons };
 if (!cfg.lessons || typeof cfg.lessons !== 'object') cfg.lessons = {};
 BANDS.forEach(b => { cfg.lessons[b] = Array.isArray(cfg.lessons[b]) ? cfg.lessons[b].filter(u => ORDER[b].includes(u)) : [ORDER[b][0]]; });
 if (!BANDS.includes(cfg.band)) cfg.band = BANDS[0];
-if (!cfg.v2) { cfg.speak = true; cfg.v2 = 1; store.set('gl1-cfg', cfg); }
-if (!cfg.skip || typeof cfg.skip !== 'object') cfg.skip = {};
-Object.keys(cfg.skip).forEach(k => {
-  const v = cfg.skip[k];
-  if (!Array.isArray(v) || v.some(x => typeof x !== 'number')) delete cfg.skip[k];
-  else if (!k.includes(':')) { cfg.skip['1:' + k] = v; delete cfg.skip[k]; }
+if (!cfg.v2) { cfg.speak = true; cfg.v2 = 1; }
+
+/* ---------- Lernstand mit stabilen Schlüsseln ----------
+   Gespeichert wird pro Wort "Band|Unit|englisches Wort" (bei Dubletten in derselben Unit mit "#2", "#3" …),
+   nicht mehr die Position in der Wortliste. Alte Stände (Zahlen-Indizes) werden beim Laden einmalig umgerechnet.
+   Im Speicher arbeitet die App weiter mit item.id; nur beim Lesen und Schreiben wird übersetzt. */
+const byKey = {};
+items.forEach(it => {
+  const base = it.b + '|' + it.u + '|' + it.en;
+  let k = base, n = 1;
+  while (byKey[k]) k = base + '#' + (++n);
+  it.key = k; byKey[k] = it;
+});
+const legacyId = x => typeof x === 'number' || (typeof x === 'string' && /^\d+$/.test(x));
+const toItem = x => legacyId(x) ? items[+x] : byKey[x];
+let migrated = false;
+const orphanSkip = {}, orphanHard = {};   // Schlüssel ohne passendes Wort (z. B. nach Änderung der Wortliste) bleiben erhalten
+const rawSkip = cfg.skip && typeof cfg.skip === 'object' ? cfg.skip : {};
+cfg.skip = {};
+Object.keys(rawSkip).forEach(k => {
+  const v = rawSkip[k]; if (!Array.isArray(v)) { migrated = true; return; }
+  const uk = k.includes(':') ? k : '1:' + k;
+  if (uk !== k) migrated = true;
+  if (UNIT[uk] && !cfg.skip[uk]) cfg.skip[uk] = [];
+  v.forEach(x => {
+    if (legacyId(x)) migrated = true;
+    const it = toItem(x);
+    if (it) { const ik = it.b + ':' + it.u; (cfg.skip[ik] = cfg.skip[ik] || []).includes(it.id) || cfg.skip[ik].push(it.id); }
+    else if (typeof x === 'string') (orphanSkip[uk] = orphanSkip[uk] || []).push(x);
+  });
 });
 (Array.isArray(cfg.open) ? cfg.open : []).forEach(k => { if (UNIT[k]) openUnits.add(k); });
-let hard = store.get('gl1-hard') || {};
+const rawHard = store.get('gl1-hard');
+let hard = {};
+Object.keys(rawHard && typeof rawHard === 'object' ? rawHard : {}).forEach(k => {
+  if (legacyId(k)) migrated = true;
+  const it = toItem(k);
+  if (it) hard[it.id] = 1; else if (!legacyId(k)) orphanHard[k] = 1;
+});
+function saveCfg() {
+  const skip = {};
+  Object.keys(cfg.skip).forEach(k => { skip[k] = cfg.skip[k].map(id => items[id].key); });
+  Object.keys(orphanSkip).forEach(k => { skip[k] = (skip[k] || []).concat(orphanSkip[k]); });
+  store.set('gl1-cfg', Object.assign({}, cfg, { skip, v3: 1 }));
+}
+function saveHard() {
+  const out = Object.assign({}, orphanHard);
+  Object.keys(hard).forEach(id => { if (items[+id]) out[items[+id].key] = 1; });
+  store.set('gl1-hard', out);
+}
+if (migrated || !cfg.v3) {
+  try {
+    if (localStorage.getItem('gl1-backup-v2') === null)
+      localStorage.setItem('gl1-backup-v2', JSON.stringify({ cfg: localStorage.getItem('gl1-cfg'), hard: localStorage.getItem('gl1-hard'), at: new Date().toISOString() }));
+  } catch (e) {}
+  cfg.v3 = 1; saveCfg(); saveHard();
+}
 
 /* ---------- Antwort prüfen ---------- */
 const byEn = {}, byDe = {};
@@ -458,10 +506,10 @@ $('#setup').addEventListener('change', e => {
   }
   else if (['dir', 'mode', 'count'].includes(t.name)) cfg[t.name] = t.value;
   else if (['random', 'speak', 'hard'].includes(t.name)) cfg[t.name] = t.checked;
-  store.set('gl1-cfg', cfg); updateBar();
+  saveCfg(); updateBar();
 });
-$('#allBtn').onclick = () => { cfg.lessons[cfg.band] = ORDER[cfg.band].slice(); store.set('gl1-cfg', cfg); syncSetup(); };
-$('#noneBtn').onclick = () => { cfg.lessons[cfg.band] = []; store.set('gl1-cfg', cfg); syncSetup(); };
+$('#allBtn').onclick = () => { cfg.lessons[cfg.band] = ORDER[cfg.band].slice(); saveCfg(); syncSetup(); };
+$('#noneBtn').onclick = () => { cfg.lessons[cfg.band] = []; saveCfg(); syncSetup(); };
 $('#startBtn').onclick = () => begin(pool(), false);
 
 /* ---------- Ablauf ---------- */
@@ -478,7 +526,14 @@ function show(name) {
 function begin(list, unlimited) {
   let l = list.slice();
   if (cfg.random) shuffle(l);
-  if (!unlimited && cfg.count !== 'all') l = l.slice(0, +cfg.count);
+  if (!unlimited && cfg.count !== 'all') {
+    // Wörter, die noch nicht sitzen, kommen bevorzugt in die Runde (höchstens die Hälfte der Plätze),
+    // den Rest füllen die übrigen ausgewählten Wörter auf.
+    const n = +cfg.count;
+    const h = l.filter(i => hard[i.id]).slice(0, Math.ceil(n / 2));
+    const pick = new Set(h.concat(l.filter(i => !hard[i.id]), l).slice(0, n));
+    l = l.filter(i => pick.has(i));
+  }
   S = {
     queue: l.map(it => ({ it, dir: cfg.dir === 'mix' ? (Math.random() < 0.5 ? 'en-de' : 'de-en') : cfg.dir })),
     total: l.length, learned: new Set(), missed: {}, firstTry: 0, flipped: false, pending: null, typed: ''
@@ -494,7 +549,7 @@ function resolve(ok) {
     S.missed[id] = (S.missed[id] || 0) + 1; hard[id] = 1;
     S.queue.splice(Math.min(S.queue.length, 4), 0, cur);
   }
-  store.set('gl1-hard', hard);
+  saveHard();
   S.flipped = false; S.pending = null; S.typed = '';
   render();
 }
@@ -590,14 +645,14 @@ function finish() {
 
 document.addEventListener('toggle', e => {
   const d = e.target;
-  if (d.classList && d.classList.contains('unitbox')) { if (d.open) openUnits.add(d.dataset.u); else openUnits.delete(d.dataset.u); cfg.open = [...openUnits]; store.set('gl1-cfg', cfg); }
+  if (d.classList && d.classList.contains('unitbox')) { if (d.open) openUnits.add(d.dataset.u); else openUnits.delete(d.dataset.u); cfg.open = [...openUnits]; saveCfg(); }
 }, true);
 $('#setup').addEventListener('click', e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
   const u = b.dataset.u, all = b.dataset.act === 'all';
   cfg.skip[u] = all ? [] : UNIT[u].map(i => i.id);
   b.closest('details').querySelectorAll('input[name=word]').forEach(i => { i.checked = all; });
-  refreshSummary(u); store.set('gl1-cfg', cfg); updateBar();
+  refreshSummary(u); saveCfg(); updateBar();
 });
 $('#backToRound').onclick = () => { show(lastView); if (lastView === 'quiz') render(); };
 buildSetup();
