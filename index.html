@@ -526,7 +526,14 @@ function show(name) {
 function begin(list, unlimited) {
   let l = list.slice();
   if (cfg.random) shuffle(l);
-  if (!unlimited && cfg.count !== 'all') l = l.slice(0, +cfg.count);
+  if (!unlimited && cfg.count !== 'all') {
+    // Wörter, die noch nicht sitzen, kommen bevorzugt in die Runde (höchstens die Hälfte der Plätze),
+    // den Rest füllen die übrigen ausgewählten Wörter auf.
+    const n = +cfg.count;
+    const h = l.filter(i => hard[i.id]).slice(0, Math.ceil(n / 2));
+    const pick = new Set(h.concat(l.filter(i => !hard[i.id]), l).slice(0, n));
+    l = l.filter(i => pick.has(i));
+  }
   S = {
     queue: l.map(it => ({ it, dir: cfg.dir === 'mix' ? (Math.random() < 0.5 ? 'en-de' : 'de-en') : cfg.dir })),
     total: l.length, learned: new Set(), missed: {}, firstTry: 0, flipped: false, pending: null, typed: ''
